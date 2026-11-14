@@ -1,0 +1,371 @@
+// Git smart HTTP: info/refs, upload-pack (protocol v2 + v0 fallback), receive-pack (v0).
+// Pure protocol over the Store; packfiles are plain (no deltas) and checksummed.
+import { collectReachable, decodePktLines, hashObject, isOid, parseCommit, parseTag, pkt, pktLines, PKT_DELIM, PKT_FLUSH, readPack, writePack, ZERO_OID, type GitObject } from './gitcore.ts';
+import type { Repo, Store } from './store.ts';
+
+export interface GitResponse { status: number; contentType: string; body: Buffer; }
+
+function sortedRefs(repo: Repo): { name: string; oid: string }[] {
+  return [...repo.git.refs.entries()].map(([name, oid]) => ({ name, oid })).sort((a, b) => (a.name < b.name ? -1 : 1));
+}
+function headTarget(repo: Repo): string { return `refs/heads/${repo.defaultBranch}`; }
+
+const V2_CAPS = [
+  'agent=github-core-clone/1.0',
+  'ls-refs=unborn',
+  'fetch=shallow filter',
+  'object-format=sha1',
+];
+const V0_CAPS = (repo: Repo): string =>
+  `symref=HEAD:${headTarget(repo)} side-band-64k thin-pack ofs-delta multi_ack shallow agent=github-core-clone/1.0`;
+
+function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
+  const refs = sortedRefs(repo);
+  const caps = service === 'git-receive-pack'
+    ? 'report-status report-status-v2 side-band-64k delete-refs ofs-delta thin-pack agent=github-core-clone/1.0'
+    : V0_CAPS(repo);
+  const items: (string | Buffer | 'flush')[] = [`# service=${service}\n`, 'flush'];
+  if (refs.length === 0) {
+    items.push(`${ZERO_OID} capabilities^{}\0${caps}\n`);
+  } else {
+    const headOid = repo.git.refs.get(headTarget(repo)) ?? refs[0]!.oid;
+    items.push(`${headOid} HEAD\0${caps}\n`);
+    for (const r of refs) {
+      items.push(`${r.oid} ${r.name}\n`);
+      const obj = repo.git.objects.get(r.oid);
+      if (obj?.type === 'tag') {
+        const target = parseTag(obj.data).object;
+        const commit = peelCommit(repo, target);
+        items.push(`${commit} ${r.name}^{}\n`);
+      }
+    }
+  }
+  items.push('flush');
+  return pktLines(items);
+}
+function peelCommit(repo: Repo, oid: string): string {
+  let cur = oid;
+  for (let i = 0; i < 10; i += 1) {
+    const obj = repo.git.objects.get(cur);
+    if (!obj || obj.type !== 'tag') return cur;
+    cur = parseTag(obj.data).object;
+  }
+  return cur;
+}
+
+export function infoRefs(store: Store, repo: Repo | undefined, service: 'git-upload-pack' | 'git-receive-pack', gitProtocol: string | undefined): GitResponse {
+  if (!repo) return { status: 404, contentType: 'application/json; charset=utf-8', body: Buffer.from(JSON.stringify({ message: 'Not Found' }) + '\n') };
+  const ct = `application/x-${service}-advertisement`;
+  if (service === 'git-upload-pack' && gitProtocol === 'version=2') {
+    const items: (string | 'flush')[] = ['version 2\n', ...V2_CAPS.map((c) => `${c}\n`), 'flush'];
+    return { status: 200, contentType: ct, body: pktLines(items) };
+  }
+  return { status: 200, contentType: ct, body: v0Advertisement(repo, service) };
+}
+
+// ---- ls-refs (v2) ----
+function lsRefs(repo: Repo, body: Buffer): GitResponse {
+  const lines = decodePktLines(body).filter((p) => p.kind === 'data').map((p) => p.payload.toString('utf8'));
+  let peel = false; let symrefs = false; const prefixes: string[] = [];
+  for (const line of lines) {
+    const t = line.replace(/\n$/, '');
+    if (t.startsWith('command=')) continue;
+    if (t.startsWith('agent=')) continue;
+    if (t.startsWith('object-format=')) continue;
+    if (t === 'peel') peel = true;
+    else if (t === 'symrefs') symrefs = true;
+    else if (t === 'unborn') { /* accepted */ }
+    else if (t.startsWith('ref-prefix ')) prefixes.push(t.slice('ref-prefix '.length));
+  }
+  const refs = sortedRefs(repo);
+  const out: string[] = [];
+  const headOid = repo.git.refs.get(headTarget(repo));
+  const include = (name: string): boolean => prefixes.length === 0 || prefixes.some((p) => name.startsWith(p));
+  if (prefixes.length === 0) {
+    if (headOid) out.push(`${headOid} HEAD${symrefs ? ` symref-target:${headTarget(repo)}` : ''}\n`);
+    else out.push(`unborn HEAD${symrefs ? ` symref-target:${headTarget(repo)}` : ''}\n`);
+  }
+  for (const r of refs) {
+    if (!include(r.name)) continue;
+    let line = `${r.oid} ${r.name}`;
+    if (peel) {
+      const obj = repo.git.objects.get(r.oid);
+      if (obj?.type === 'tag') line += ` peeled:${peelCommit(repo, parseTag(obj.data).object)}`;
+    }
+    out.push(`${line}\n`);
+  }
+  out.push('flush' as never);
+  const items: (string | 'flush')[] = out.map((s) => (s === 'flush' ? 'flush' : s));
+  return { status: 200, contentType: 'application/x-git-upload-pack-result', body: pktLines(items) };
+}
+
+// ---- fetch: compute the object set to send ----
+interface FetchReq { wants: string[]; haves: string[]; shallow: string[]; depth?: number; }
+function fetchObjects(store: Store, repo: Repo, req: FetchReq): { objects: GitObject[]; shallow: string[]; unshallow: string[]; acks: string[]; empty: boolean } {
+  const lookup = store.lookup(repo);
+  const shallowSet = new Set(req.shallow);
+  // Held set: closure of haves, not crossing shallow boundaries' parents.
+  const held = new Set<string>();
+  for (const h of req.haves) {
+    try {
+      for (const oid of collectReachable([h], lookup, { stopAt: shallowSet })) held.add(oid);
+    } catch { /* have object unknown to us: ignore */ }
+  }
+  // Wanted set with depth limit.
+  const wanted = new Set<string>();
+  const shallowOut: string[] = [];
+  const commitDepth = new Map<string, number>();
+  const queue: { oid: string; depth: number }[] = req.wants.map((w) => ({ oid: w, depth: 0 }));
+  const seenCommit = new Set<string>();
+  const addClosure = (oid: string): void => {
+    try { for (const o of collectReachable([oid], lookup)) wanted.add(o); } catch { /* ignore */ }
+  };
+  if (req.depth === undefined) {
+    for (const w of req.wants) {
+      const obj = repo.git.objects.get(w);
+      if (!obj) continue;
+      if (obj.type === 'tag') { wanted.add(w); addClosure(peelCommit(repo, parseTag(obj.data).object)); }
+      else addClosure(w);
+    }
+  } else {
+    // BFS over commits from wants, bounded by depth; trees/blobs of included commits fully.
+    const q: { oid: string; d: number }[] = [];
+    for (const w of req.wants) {
+      const obj = repo.git.objects.get(w);
+      if (!obj) continue;
+      if (obj.type === 'tag') { wanted.add(w); q.push({ oid: peelCommit(repo, parseTag(obj.data).object), d: 0 }); }
+      else q.push({ oid: w, d: 0 });
+    }
+    while (q.length) {
+      const { oid, d } = q.shift()!;
+      if (seenCommit.has(oid)) continue;
+      seenCommit.add(oid);
+      const obj = repo.git.objects.get(oid);
+      if (!obj || obj.type !== 'commit') continue;
+      commitDepth.set(oid, d);
+      // include this commit + its tree/blobs (not parents)
+      wanted.add(oid);
+      const c = parseCommit(obj.data);
+      try { for (const o of collectReachable([c.tree], lookup)) wanted.add(o); } catch { /* ignore */ }
+      if (d + 1 < req.depth) { for (const p of c.parents) q.push({ oid: p, d: d + 1 }); }
+      else shallowOut.push(oid);
+    }
+  }
+  const send = [...wanted].filter((oid) => !held.has(oid));
+  const unshallow = req.shallow.filter((s) => {
+    // a former boundary whose parent is now included (i.e. it is no longer a boundary)
+    if (!commitDepth.has(s)) return false;
+    const obj = repo.git.objects.get(s);
+    if (!obj || obj.type !== 'commit') return false;
+    return parseCommit(obj.data).parents.some((p) => commitDepth.has(p));
+  });
+  const objects: GitObject[] = [];
+  for (const oid of send) {
+    const o = repo.git.objects.get(oid);
+    if (o) objects.push(o);
+  }
+  const acks = req.haves.filter((h) => req.wants.includes(h) && repo.git.objects.has(h));
+  const empty = send.length === 0;
+  return { objects, shallow: shallowOut, unshallow, acks, empty };
+}
+
+function sidebandPack(objects: GitObject[]): Buffer {
+  if (objects.length === 0) return Buffer.alloc(0);
+  const pack = writePack(objects);
+  const chunks: Buffer[] = [];
+  // A pkt-line is at most 65520 bytes total, so the payload (1 band byte + data)
+  // is at most 65516: data slices are capped at 65515.
+  const MAX = 65515;
+  for (let off = 0; off < pack.length; off += MAX) {
+    const slice = pack.subarray(off, Math.min(pack.length, off + MAX));
+    const payload = Buffer.concat([Buffer.from([1]), slice]);
+    chunks.push(pkt(payload));
+  }
+  return Buffer.concat(chunks);
+}
+
+function fetchV2(store: Store, repo: Repo, body: Buffer): GitResponse {
+  const lines = decodePktLines(body).filter((p) => p.kind === 'data').map((p) => p.payload.toString('utf8'));
+  const req: FetchReq = { wants: [], haves: [], shallow: [] };
+  for (const line of lines) {
+    const t = line.replace(/\n$/, '');
+    if (t.startsWith('command=')) continue;
+    if (t.startsWith('agent=')) continue;
+    if (t.startsWith('object-format=')) continue;
+    if (t === 'thin-pack' || t === 'no-progress' || t === 'ofs-delta' || t === 'done') continue;
+    if (t.startsWith('filter ')) continue;
+    if (t.startsWith('want ')) req.wants.push(t.slice(5).trim());
+    else if (t.startsWith('have ')) req.haves.push(t.slice(5).trim());
+    else if (t.startsWith('shallow ')) req.shallow.push(t.slice(8).trim());
+    else if (t.startsWith('deepen ')) req.depth = parseInt(t.slice(7), 10);
+    else if (t.startsWith('deepen-since ')) { /* ignored */ }
+    else if (t.startsWith('deepen-not ')) { /* ignored */ }
+  }
+  const res = fetchObjects(store, repo, req);
+  const parts: Buffer[] = [];
+  const ackLines: string[] = [];
+  if (res.acks.length) for (const a of res.acks) ackLines.push(`ACK ${a}\n`);
+  else ackLines.push('NAK\n');
+  parts.push(pkt('acknowledgments\n'));
+  for (const l of ackLines) parts.push(pkt(l));
+  parts.push(PKT_DELIM);
+  if (res.shallow.length || res.unshallow.length) {
+    parts.push(pkt('shallow-info\n'));
+    for (const s of res.shallow) parts.push(pkt(`shallow ${s}\n`));
+    for (const s of res.unshallow) parts.push(pkt(`unshallow ${s}\n`));
+    parts.push(PKT_DELIM);
+  }
+  if (!res.empty) {
+    parts.push(pkt('packfile\n'));
+    parts.push(sidebandPack(res.objects));
+  }
+  parts.push(PKT_FLUSH);
+  return { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(parts) };
+}
+
+function fetchV0(store: Store, repo: Repo, body: Buffer): GitResponse {
+  const packets = decodePktLines(body);
+  const req: FetchReq = { wants: [], haves: [], shallow: [] };
+  let seenFlush = false;
+  for (const p of packets) {
+    if (p.kind === 'flush') { seenFlush = true; continue; }
+    if (p.kind !== 'data') continue;
+    const t = p.payload.toString('utf8').replace(/\n$/, '');
+    if (t.startsWith('want ')) {
+      const rest = t.slice(5).trim();
+      req.wants.push(rest.split(' ')[0]!);
+    } else if (t.startsWith('have ')) req.haves.push(t.slice(5).trim());
+    else if (t.startsWith('shallow ')) req.shallow.push(t.slice(8).trim());
+    else if (t.startsWith('deepen ')) req.depth = parseInt(t.slice(7), 10);
+    else if (t.startsWith('deepen-since ')) { /* ignored */ }
+    else if (t.startsWith('deepen-not ')) { /* ignored */ }
+    else if (t === 'done') { /* end of negotiation */ }
+  }
+  void seenFlush;
+  const res = fetchObjects(store, repo, req);
+  const parts: Buffer[] = [];
+  if (res.acks.length) for (const a of res.acks) parts.push(pkt(`ACK ${a}\n`));
+  else parts.push(pkt('NAK\n'));
+  for (const s of res.shallow) parts.push(pkt(`shallow ${s}\n`));
+  for (const s of res.unshallow) parts.push(pkt(`unshallow ${s}\n`));
+  if (!res.empty) parts.push(sidebandPack(res.objects));
+  parts.push(PKT_FLUSH);
+  return { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(parts) };
+}
+
+export function uploadPack(store: Store, repo: Repo | undefined, body: Buffer, gitProtocol: string | undefined): GitResponse {
+  if (!repo) return { status: 404, contentType: 'application/json; charset=utf-8', body: Buffer.from(JSON.stringify({ message: 'Not Found' }) + '\n') };
+  const first = decodePktLines(body).find((p) => p.kind === 'data');
+  const firstText = first ? first.payload.toString('utf8') : '';
+  // Dispatch purely on the command= line: the Git-Protocol: version=2 header is
+  // present on both ls-refs and fetch, so it must never select the handler.
+  void gitProtocol;
+  if (firstText.startsWith('command=ls-refs')) return lsRefs(repo, body);
+  if (firstText.startsWith('command=fetch')) return fetchV2(store, repo, body);
+  if (firstText.startsWith('command=')) return { status: 400, contentType: 'application/json; charset=utf-8', body: Buffer.from(JSON.stringify({ message: 'unknown command' }) + '\n') };
+  // v0: wants/haves/deepen — but a body that is not pkt-lines at all is malformed.
+  if (!first) return { status: 400, contentType: 'application/json; charset=utf-8', body: Buffer.from(JSON.stringify({ message: 'malformed request' }) + '\n') };
+  return fetchV0(store, repo, body);
+}
+
+// ---- receive-pack ----
+interface PushCmd { oldOid: string; newOid: string; ref: string; }
+export function receivePack(store: Store, repo: Repo | undefined, body: Buffer): GitResponse {
+  const errBody = (status: number, message: string): GitResponse =>
+    ({ status, contentType: 'application/json; charset=utf-8', body: Buffer.from(JSON.stringify({ message }) + '\n') });
+  if (!repo) return errBody(404, 'Not Found');
+  const packets = decodePktLines(body);
+  const commands: PushCmd[] = [];
+  let packStart = -1;
+  for (let i = 0; i < packets.length; i += 1) {
+    const p = packets[i]!;
+    if (p.kind === 'flush') { packStart = i + 1; break; }
+    if (p.kind !== 'data') continue;
+    let text = p.payload.toString('utf8');
+    const nul = text.indexOf('\0');
+    if (nul >= 0) text = text.slice(0, nul);
+    const line = text.replace(/\n$/, '');
+    const m = /^([0-9a-f]{40}) ([0-9a-f]{40}) (\S+)$/.exec(line);
+    if (!m) return errBody(400, 'malformed command');
+    commands.push({ oldOid: m[1]!, newOid: m[2]!, ref: m[3]! });
+  }
+  if (commands.length === 0) return errBody(400, 'no commands');
+  // The pack follows the flush packet in the raw body: recompute its byte offset.
+  let offset = 0; let packBytes = Buffer.alloc(0);
+  {
+    let idx = 0;
+    for (const p of packets) {
+      const rawLen = p.kind === 'data' ? p.payload.length + 4 : 4;
+      offset += rawLen; idx += 1;
+      if (p.kind === 'flush') break;
+    }
+    void idx;
+    if (offset < body.length) packBytes = body.subarray(offset);
+  }
+  void packStart;
+  const reportLines: string[] = [];
+  let unpackOk = true;
+  const needsPack = commands.some((c) => c.newOid !== ZERO_OID);
+  if (needsPack && packBytes.length > 0) {
+    try {
+      const entries = readPack(packBytes, (oid) => repo.git.objects.get(oid));
+      for (const e of entries) {
+        if (!repo.git.objects.has(e.oid)) repo.git.objects.set(e.oid, { type: e.type, data: e.data });
+      }
+    } catch (e) {
+      unpackOk = false;
+      reportLines.push(`unpack ${(e instanceof Error ? e.message : 'unpack error').replace(/\n/g, ' ')}`);
+    }
+  } else if (needsPack && packBytes.length === 0) {
+    unpackOk = false;
+    reportLines.push('unpack missing packfile');
+  }
+  if (unpackOk) reportLines.push('unpack ok');
+  for (const cmd of commands) {
+    let ok = false; let reason = '';
+    if (!unpackOk) { reason = 'unpack failed'; }
+    else if (cmd.newOid === ZERO_OID) {
+      const cur = repo.git.refs.get(cmd.ref);
+      if (cur === undefined) { reason = 'remote ref does not exist'; }
+      else if (cmd.oldOid !== ZERO_OID && cmd.oldOid !== cur) { reason = 'non-fast-forward'; }
+      else { repo.git.refs.delete(cmd.ref); ok = true; }
+    } else {
+      const newObj = repo.git.objects.get(cmd.newOid);
+      if (!newObj) { reason = 'object not found'; }
+      else {
+        const cur = repo.git.refs.get(cmd.ref);
+        if (cmd.oldOid === ZERO_OID) {
+          if (cur !== undefined) reason = 'already exists';
+          else { repo.git.refs.set(cmd.ref, cmd.newOid); ok = true; }
+        } else if (cur === undefined) { reason = 'remote ref does not exist'; }
+        else if (cur !== cmd.oldOid) { reason = 'non-fast-forward'; }
+        else {
+          // Fast-forward: new tip must descend from old tip (peel tags to commits).
+          const newCommit = cmd.ref.startsWith('refs/tags/') ? peelCommit(repo, cmd.newOid) : cmd.newOid;
+          const oldCommit = cmd.ref.startsWith('refs/tags/') ? peelCommit(repo, cmd.oldOid) : cmd.oldOid;
+          const lookup = store.lookup(repo);
+          const desc = newCommit === oldCommit || (isOid(newCommit) && isOid(oldCommit) && (() => { try { return collectReachable([newCommit], lookup).has(oldCommit); } catch { return false; } })());
+          if (desc) { repo.git.refs.set(cmd.ref, cmd.newOid); ok = true; }
+          else reason = 'non-fast-forward';
+        }
+      }
+    }
+    reportLines.push(ok ? `ok ${cmd.ref}` : `ng ${cmd.ref} ${reason}`);
+  }
+  const reportText = reportLines.map((l) => `${l}\n`).join('');
+  const reportPkts = pktLines([...reportLines.map((l) => `${l}\n`), 'flush']);
+  const band1 = Buffer.concat([Buffer.from([1]), reportPkts]);
+  void reportText;
+  const bodyOut = pkt(band1.subarray(1).length + 1 >= 0 ? band1 : band1);
+  // Sideband framing: each band-1 payload is one pkt-line; send the report pkt-lines as band 1.
+  const chunks: Buffer[] = [];
+  for (const line of reportLines) {
+    const payload = Buffer.concat([Buffer.from([1]), pkt(`${line}\n`)]);
+    chunks.push(pkt(payload));
+  }
+  chunks.push(pkt(Buffer.concat([Buffer.from([1]), PKT_FLUSH])));
+  void bodyOut;
+  return { status: 200, contentType: 'application/x-git-receive-pack-result', body: Buffer.concat(chunks) };
+}
+
+export { hashObject };
