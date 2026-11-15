@@ -182,9 +182,20 @@ function applyDelta(base: Buffer, delta: Buffer): Buffer {
   return Buffer.concat(out);
 }
 export interface PackEntry { type: GitObjectType; data: Buffer; oid: string; }
+/** A packfile is rejected whole before any of its objects is stored: a caller that
+ * parses with readPack only ever sees entries of a fully valid pack. Validation order:
+ * size, magic, version, SHA-1 trailer, object count bound, then the entries, then the
+ * exact end offset (no trailing bytes, no truncation). */
+const MAX_PACK_ENTRIES = 100_000;
+
 export function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObject | undefined): PackEntry[] {
-  if (pack.length < 12 || pack.subarray(0, 4).toString('ascii') !== 'PACK') throw new Error('bad pack header');
+  if (pack.length < 32) throw new Error('pack too small');
+  if (pack.subarray(0, 4).toString('ascii') !== 'PACK') throw new Error('bad pack header');
+  const version = pack.readUInt32BE(4);
+  if (version !== 2 && version !== 3) throw new Error(`unsupported pack version ${version}`);
+  if (!packChecksumOk(pack)) throw new Error('pack checksum mismatch');
   const count = pack.readUInt32BE(8);
+  if (count > MAX_PACK_ENTRIES) throw new Error('pack declares too many objects');
   let off = 12;
   const entries: PackEntry[] = [];
   const byOffset = new Map<number, PackEntry>();
@@ -197,6 +208,7 @@ export function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObject 
     if (typeCode === 6) { // OFS_DELTA
       let b = pack[off]!; off += 1; let baseOff = b & 0x7f;
       while (b & 0x80) { b = pack[off]!; off += 1; baseOff = ((baseOff + 1) << 7) | (b & 0x7f); }
+      if (baseOff <= 0 || start - baseOff < 12) throw new Error('ofs delta base out of range');
       const baseEntry = byOffset.get(start - baseOff);
       if (!baseEntry) throw new Error('ofs delta base missing');
       const { data, next } = inflateAt(pack, off, size);
@@ -219,6 +231,7 @@ export function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObject 
       entries.push(entry); byOffset.set(start, entry); off = next;
     }
   }
+  if (off !== pack.length - 20) throw new Error('pack is truncated or has trailing bytes');
   return entries;
 }
 export function packChecksumOk(pack: Buffer): boolean {

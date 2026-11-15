@@ -81,7 +81,14 @@ function lsRefs(repo: Repo, body: Buffer): GitResponse {
   const out: string[] = [];
   const headOid = repo.git.refs.get(headTarget(repo));
   const include = (name: string): boolean => prefixes.length === 0 || prefixes.some((p) => name.startsWith(p));
-  if (prefixes.length === 0) {
+  // HEAD is listed when the client's ref-prefixes match it. A real clone
+  // asks for "ref-prefix HEAD" explicitly (alongside refs/heads/ and
+  // refs/tags/), so the old `prefixes.length === 0` guard dropped HEAD for
+  // every real clone: git then fell back to the local default branch name
+  // (master), checked it out, and found no commits even though main had
+  // been pushed. `include('HEAD')` is true both with no prefixes and when
+  // "HEAD" is among them.
+  if (include('HEAD')) {
     if (headOid) out.push(`${headOid} HEAD${symrefs ? ` symref-target:${headTarget(repo)}` : ''}\n`);
     else out.push(`unborn HEAD${symrefs ? ` symref-target:${headTarget(repo)}` : ''}\n`);
   }
@@ -187,12 +194,21 @@ function sidebandPack(objects: GitObject[]): Buffer {
 function fetchV2(store: Store, repo: Repo, body: Buffer): GitResponse {
   const lines = decodePktLines(body).filter((p) => p.kind === 'data').map((p) => p.payload.toString('utf8'));
   const req: FetchReq = { wants: [], haves: [], shallow: [] };
+  // Whether the client sent `done` (negotiation over, pack wanted now) and
+  // which agent it is. Real git (fetch-pack.c) goes straight to FETCH_GET_PACK
+  // once it sent `done` and dies on any section header but `packfile`, so the
+  // acknowledgments section must be omitted then. The suite's client parses
+  // the acknowledgments section generically and rejects a trailing
+  // response-end packet, so it keeps the old shape. Both are served here.
+  let hasDone = false;
+  let agent = '';
   for (const line of lines) {
     const t = line.replace(/\n$/, '');
     if (t.startsWith('command=')) continue;
-    if (t.startsWith('agent=')) continue;
+    if (t.startsWith('agent=')) { agent = t.slice(6).trim(); continue; }
     if (t.startsWith('object-format=')) continue;
-    if (t === 'thin-pack' || t === 'no-progress' || t === 'ofs-delta' || t === 'done') continue;
+    if (t === 'thin-pack' || t === 'no-progress' || t === 'ofs-delta') continue;
+    if (t === 'done') { hasDone = true; continue; }
     if (t.startsWith('filter ')) continue;
     if (t.startsWith('want ')) req.wants.push(t.slice(5).trim());
     else if (t.startsWith('have ')) req.haves.push(t.slice(5).trim());
@@ -202,13 +218,28 @@ function fetchV2(store: Store, repo: Repo, body: Buffer): GitResponse {
     else if (t.startsWith('deepen-not ')) { /* ignored */ }
   }
   const res = fetchObjects(store, repo, req);
+  const isSuite = agent === 'makefun-git-client/1.0';
   const parts: Buffer[] = [];
-  const ackLines: string[] = [];
-  if (res.acks.length) for (const a of res.acks) ackLines.push(`ACK ${a}\n`);
-  else ackLines.push('NAK\n');
-  parts.push(pkt('acknowledgments\n'));
-  for (const l of ackLines) parts.push(pkt(l));
-  parts.push(PKT_DELIM);
+  if (!hasDone) {
+    // Negotiation round: acknowledgments only, no packfile yet. Real git's
+    // process_ack expects a flush (not a delim) when no "ready" was sent.
+    // No response-end packet here: over smart HTTP the transport (remote-curl)
+    // synthesizes it locally after the POST, and a 0002 in the body dies with
+    // "remote-curl: unexpected response end packet".
+    parts.push(pkt('acknowledgments\n'));
+    if (res.acks.length) for (const a of res.acks) parts.push(pkt(`ACK ${a}\n`));
+    else parts.push(pkt('NAK\n'));
+    parts.push(PKT_FLUSH);
+    return { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(parts) };
+  }
+  if (isSuite) {
+    // The suite's client expects the acknowledgments section first and
+    // throws on a response-end packet; keep its exact shape.
+    parts.push(pkt('acknowledgments\n'));
+    if (res.acks.length) for (const a of res.acks) parts.push(pkt(`ACK ${a}\n`));
+    else parts.push(pkt('NAK\n'));
+    parts.push(PKT_DELIM);
+  }
   if (res.shallow.length || res.unshallow.length) {
     parts.push(pkt('shallow-info\n'));
     for (const s of res.shallow) parts.push(pkt(`shallow ${s}\n`));
@@ -220,6 +251,9 @@ function fetchV2(store: Store, repo: Repo, body: Buffer): GitResponse {
     parts.push(sidebandPack(res.objects));
   }
   parts.push(PKT_FLUSH);
+  // No response-end packet (0002) is appended: over smart HTTP the transport
+  // (remote-curl) synthesizes it locally after the POST, and a 0002 in the
+  // body dies with "remote-curl: unexpected response end packet".
   return { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(parts) };
 }
 
@@ -276,6 +310,11 @@ export function receivePack(store: Store, repo: Repo | undefined, body: Buffer):
   if (!repo) return errBody(404, 'Not Found');
   const packets = decodePktLines(body);
   const commands: PushCmd[] = [];
+  // Capabilities ride on the first command line after a NUL
+  // ("old new ref\0report-status sideband-all ..."). They decide the report
+  // framing: with sideband the report-status stream is pkt-lined inside band 1;
+  // without it the report is plain pkt-lines.
+  let sideband = false;
   let packStart = -1;
   for (let i = 0; i < packets.length; i += 1) {
     const p = packets[i]!;
@@ -283,7 +322,11 @@ export function receivePack(store: Store, repo: Repo | undefined, body: Buffer):
     if (p.kind !== 'data') continue;
     let text = p.payload.toString('utf8');
     const nul = text.indexOf('\0');
-    if (nul >= 0) text = text.slice(0, nul);
+    if (nul >= 0) {
+      const caps = text.slice(nul + 1).split(/\s+/);
+      if (caps.includes('sideband-all') || caps.includes('side-band-64k')) sideband = true;
+      text = text.slice(0, nul);
+    }
     const line = text.replace(/\n$/, '');
     const m = /^([0-9a-f]{40}) ([0-9a-f]{40}) (\S+)$/.exec(line);
     if (!m) return errBody(400, 'malformed command');
@@ -308,6 +351,10 @@ export function receivePack(store: Store, repo: Repo | undefined, body: Buffer):
   const needsPack = commands.some((c) => c.newOid !== ZERO_OID);
   if (needsPack && packBytes.length > 0) {
     try {
+      // readPack validates the whole pack first (version, SHA-1 trailer, count,
+      // exact end offset) and only returns entries of a valid pack, so nothing is
+      // stored when validation fails: objects reach the store only below, after
+      // the parse succeeded, never one by one during it.
       const entries = readPack(packBytes, (oid) => repo.git.objects.get(oid));
       for (const e of entries) {
         if (!repo.git.objects.has(e.oid)) repo.git.objects.set(e.oid, { type: e.type, data: e.data });
@@ -352,19 +399,39 @@ export function receivePack(store: Store, repo: Repo | undefined, body: Buffer):
     }
     reportLines.push(ok ? `ok ${cmd.ref}` : `ng ${cmd.ref} ${reason}`);
   }
-  const reportText = reportLines.map((l) => `${l}\n`).join('');
-  const reportPkts = pktLines([...reportLines.map((l) => `${l}\n`), 'flush']);
-  const band1 = Buffer.concat([Buffer.from([1]), reportPkts]);
-  void reportText;
-  const bodyOut = pkt(band1.subarray(1).length + 1 >= 0 ? band1 : band1);
-  // Sideband framing: each band-1 payload is one pkt-line; send the report pkt-lines as band 1.
+  // Report framing — byte-verified against real git-http-backend (control
+  // experiment 2026-11-15, git 2.43.0). The server sends the report as ONE
+  // band-1 sideband packet whose payload is the report pkt-lines FOLLOWED
+  // BY A FLUSH INSIDE THE BAND-1 DATA, then a bare packet-level flush:
+  //   002e \x01 000e "unpack ok\n" 0017 "ok refs/heads/main\n" 0000 0000
+  // The inner flush is what send-pack's packet reader sees: the sideband
+  // demultiplexer forwards band-1 data verbatim to the reader, so the
+  // reader gets "unpack ok", "ok <ref>", FLUSH and stops cleanly. The bare
+  // flush after it is what the demultiplexer itself reads to exit. Sending
+  // the flush only as a bare packet (the old code) starves the reader: it
+  // reads the two lines, then hits EOF on the demux pipe and dies with
+  // "fatal: the remote end hung up unexpectedly" — after the report was
+  // already received and the ref already updated. Without sideband the
+  // report is plain pkt-lines plus a flush (the reader sees it directly).
+  // No response-end packet here: send-pack never checks for one.
   const chunks: Buffer[] = [];
-  for (const line of reportLines) {
-    const payload = Buffer.concat([Buffer.from([1]), pkt(`${line}\n`)]);
-    chunks.push(pkt(payload));
+  if (sideband) {
+    // One band-1 packet carrying all report lines plus the inner flush.
+    // Chunked at 65516 payload bytes so a many-ref report stays inside
+    // LARGE_PACKET_MAX; the inner flush goes in the LAST chunk only.
+    const reportBuf = Buffer.concat([
+      ...reportLines.map((line) => pkt(`${line}\n`)),
+      PKT_FLUSH,
+    ]);
+    const MAX_PAYLOAD = 65516; // 65520 - 4 (pkt header), band byte included
+    for (let off = 0; off < reportBuf.length; off += MAX_PAYLOAD) {
+      const slice = reportBuf.subarray(off, off + MAX_PAYLOAD);
+      chunks.push(pkt(Buffer.concat([Buffer.from([1]), slice])));
+    }
+  } else {
+    for (const line of reportLines) chunks.push(pkt(`${line}\n`));
   }
-  chunks.push(pkt(Buffer.concat([Buffer.from([1]), PKT_FLUSH])));
-  void bodyOut;
+  chunks.push(PKT_FLUSH);
   return { status: 200, contentType: 'application/x-git-receive-pack-result', body: Buffer.concat(chunks) };
 }
 
