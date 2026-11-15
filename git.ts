@@ -1,6 +1,6 @@
 // Git smart HTTP: info/refs, upload-pack (protocol v2 + v0 fallback), receive-pack (v0).
 // Pure protocol over the Store; packfiles are plain (no deltas) and checksummed.
-import { collectReachable, decodePktLines, hashObject, isOid, parseCommit, parseTag, pkt, pktLines, PKT_DELIM, PKT_FLUSH, readPack, writePack, ZERO_OID, type GitObject } from './gitcore.ts';
+import { collectReachable, decodePktLines, hashObject, isAncestor, isOid, parseCommit, parseTag, pkt, pktLines, PKT_DELIM, PKT_FLUSH, readPack, writePack, ZERO_OID, type GitObject } from './gitcore.ts';
 import type { Repo, Store } from './store.ts';
 
 export interface GitResponse { status: number; contentType: string; body: Buffer; }
@@ -191,6 +191,37 @@ function sidebandPack(objects: GitObject[]): Buffer {
   return Buffer.concat(chunks);
 }
 
+/** Fetch + pack cache. Git objects are immutable and only added, so a fetch
+ * result is stable for a given repo, object count, and request: the 50
+ * concurrent clones of one repo are identical requests, so one graph walk
+ * and one pack build serve them all. The object count in the key is what
+ * makes it safe: any push grows the count and busts the entry. */
+type FetchResult = { objects: GitObject[]; shallow: string[]; unshallow: string[]; acks: string[]; empty: boolean };
+const fetchCache = new Map<string, FetchResult>();
+const packCache = new Map<string, Buffer>();
+function fetchKey(repo: Repo, req: FetchReq): string {
+  return `${repo.id}|${repo.git.objects.size}|${req.wants.join(',')}|${req.haves.join(',')}|${req.shallow.join(',')}|${req.depth ?? ''}`;
+}
+function fetchCached(store: Store, repo: Repo, req: FetchReq): { res: FetchResult; key: string } {
+  const key = fetchKey(repo, req);
+  let res = fetchCache.get(key);
+  if (!res) {
+    res = fetchObjects(store, repo, req);
+    if (fetchCache.size >= 256) { const first = fetchCache.keys().next().value; if (first !== undefined) fetchCache.delete(first); }
+    fetchCache.set(key, res);
+  }
+  return { res, key };
+}
+function sidebandCached(key: string, objects: GitObject[]): Buffer {
+  let buf = packCache.get(key);
+  if (!buf) {
+    buf = sidebandPack(objects);
+    if (packCache.size >= 256) { const first = packCache.keys().next().value; if (first !== undefined) packCache.delete(first); }
+    packCache.set(key, buf);
+  }
+  return buf;
+}
+
 function fetchV2(store: Store, repo: Repo, body: Buffer): GitResponse {
   const lines = decodePktLines(body).filter((p) => p.kind === 'data').map((p) => p.payload.toString('utf8'));
   const req: FetchReq = { wants: [], haves: [], shallow: [] };
@@ -217,7 +248,7 @@ function fetchV2(store: Store, repo: Repo, body: Buffer): GitResponse {
     else if (t.startsWith('deepen-since ')) { /* ignored */ }
     else if (t.startsWith('deepen-not ')) { /* ignored */ }
   }
-  const res = fetchObjects(store, repo, req);
+  const { res, key } = fetchCached(store, repo, req);
   const isSuite = agent === 'makefun-git-client/1.0';
   const parts: Buffer[] = [];
   if (!hasDone) {
@@ -248,7 +279,7 @@ function fetchV2(store: Store, repo: Repo, body: Buffer): GitResponse {
   }
   if (!res.empty) {
     parts.push(pkt('packfile\n'));
-    parts.push(sidebandPack(res.objects));
+    parts.push(sidebandCached(key, res.objects));
   }
   parts.push(PKT_FLUSH);
   // No response-end packet (0002) is appended: over smart HTTP the transport
@@ -276,13 +307,13 @@ function fetchV0(store: Store, repo: Repo, body: Buffer): GitResponse {
     else if (t === 'done') { /* end of negotiation */ }
   }
   void seenFlush;
-  const res = fetchObjects(store, repo, req);
+  const { res, key } = fetchCached(store, repo, req);
   const parts: Buffer[] = [];
   if (res.acks.length) for (const a of res.acks) parts.push(pkt(`ACK ${a}\n`));
   else parts.push(pkt('NAK\n'));
   for (const s of res.shallow) parts.push(pkt(`shallow ${s}\n`));
   for (const s of res.unshallow) parts.push(pkt(`unshallow ${s}\n`));
-  if (!res.empty) parts.push(sidebandPack(res.objects));
+  if (!res.empty) parts.push(sidebandCached(key, res.objects));
   parts.push(PKT_FLUSH);
   return { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(parts) };
 }
@@ -391,7 +422,7 @@ export function receivePack(store: Store, repo: Repo | undefined, body: Buffer):
           const newCommit = cmd.ref.startsWith('refs/tags/') ? peelCommit(repo, cmd.newOid) : cmd.newOid;
           const oldCommit = cmd.ref.startsWith('refs/tags/') ? peelCommit(repo, cmd.oldOid) : cmd.oldOid;
           const lookup = store.lookup(repo);
-          const desc = newCommit === oldCommit || (isOid(newCommit) && isOid(oldCommit) && (() => { try { return collectReachable([newCommit], lookup).has(oldCommit); } catch { return false; } })());
+          const desc = newCommit === oldCommit || (isOid(newCommit) && isOid(oldCommit) && (() => { try { return isAncestor(oldCommit, newCommit, lookup); } catch { return false; } })());
           if (desc) { repo.git.refs.set(cmd.ref, cmd.newOid); ok = true; }
           else reason = 'non-fast-forward';
         }

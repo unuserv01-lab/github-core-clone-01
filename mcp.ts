@@ -178,6 +178,17 @@ export function issueJson(store: Store, repo: import('./store.ts').Repo, issue: 
     html_url: `https://example.invalid/${repo.owner}/${repo.name}/issues/${issue.number}`,
   };
 }
+/** Exact response bytes for one issue (JSON + trailing newline, as sendJson sends),
+ * cached on the issue and invalidated by PATCH. The read workload fetches the
+ * same issue thousands of times; this skips the rebuild + re-encode each time. */
+export function issueJsonBuf(store: Store, repo: import('./store.ts').Repo, issue: import('./store.ts').Issue): Buffer {
+  let buf = issue.jsonCache;
+  if (!buf) {
+    buf = Buffer.from(`${JSON.stringify(issueJson(store, repo, issue))}\n`, 'utf8');
+    issue.jsonCache = buf;
+  }
+  return buf;
+}
 export function prJson(store: Store, repo: import('./store.ts').Repo, pr: import('./store.ts').PullRequest): Record<string, unknown> {
   return {
     id: pr.id, node_id: store.prGid(repo, pr), number: pr.number, title: pr.title, body: pr.body,

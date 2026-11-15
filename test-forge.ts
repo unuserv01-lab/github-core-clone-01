@@ -282,6 +282,24 @@ await test('mcp: unknown tool / missing argument / parse error / no auth', async
   eq(r.status, 401, 'mcp without token is 401');
 });
 
+// ---------- E. REST: cached single-issue body ----------
+await test('rest: single-issue GET is cached but PATCH invalidates it', async () => {
+  const num = issue1.number as number;
+  const [s1, b1] = await req('GET', `/api/v3/repos/${owner}/forge-test/issues/${num}`);
+  eq(s1, 200, 'first GET status');
+  eq(b1.title, 'First bug', 'first GET title');
+  const [s2, b2] = await req('GET', `/api/v3/repos/${owner}/forge-test/issues/${num}`);
+  eq(s2, 200, 'second GET status');
+  eq(JSON.stringify(b2), JSON.stringify(b1), 'cached GET is identical');
+  const [s3, b3] = await req('PATCH', `/api/v3/repos/${owner}/forge-test/issues/${num}`, { title: 'First bug (fixed)', state: 'closed' });
+  eq(s3, 200, 'PATCH status');
+  eq(b3.title, 'First bug (fixed)', 'PATCH response title');
+  const [, b4] = await req('GET', `/api/v3/repos/${owner}/forge-test/issues/${num}`);
+  eq(b4.title, 'First bug (fixed)', 'GET after PATCH shows new title');
+  eq(b4.state, 'closed', 'GET after PATCH shows new state');
+  await req('PATCH', `/api/v3/repos/${owner}/forge-test/issues/${num}`, { title: 'First bug', state: 'open' });
+});
+
 // ---------- C. git smart HTTP with the real git CLI ----------
 const gitHome = mkdtempSync(join(tmpdir(), 'forge-git-'));
 const gitEnv = { ...process.env, HOME: gitHome, GIT_AUTHOR_NAME: 'Forge Test', GIT_AUTHOR_EMAIL: 'forge@test.invalid', GIT_COMMITTER_NAME: 'Forge Test', GIT_COMMITTER_EMAIL: 'forge@test.invalid', GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0' };
@@ -329,6 +347,33 @@ await test('git: fetch, new branch, fast-forward push, non-fast-forward rejectio
   try { git(d, 'push origin main'); } catch (e) { rejected = /non-fast-forward|rejected|failed to push/i.test(String((e as any).stderr ?? e)); }
   ok(rejected, 'non-fast-forward push rejected');
   git(d, 'reset --hard origin/main');
+});
+await test('git: 30 sequential pushes on one chain all fast-forward', async () => {
+  // Own repo: the shared forge-test repo (and cloneDir's main) must stay in sync
+  // for the delta/atomicity tests that follow.
+  await req('POST', '/api/v3/user/repos', { name: 'forge-chain', description: 'chain' });
+  const chainRemote = `${base}/${owner}/forge-chain.git`;
+  const d2 = mkdtempSync(join(work, 'forge-chain-'));
+  git(d2, `clone ${chainRemote} chain`);
+  const cdir = join(d2, 'chain');
+  writeFileSync(join(cdir, 'chain.txt'), 'change 0\n');
+  git(cdir, 'add chain.txt');
+  git(cdir, 'commit -m "chain 0"');
+  git(cdir, 'push origin HEAD:main');
+  for (let i = 1; i < 30; i += 1) {
+    writeFileSync(join(cdir, 'chain.txt'), `change ${i}\n`);
+    git(cdir, 'add chain.txt');
+    git(cdir, `commit -m "chain ${i}"`);
+    git(cdir, 'push origin main');
+  }
+  const log = git(cdir, 'log --oneline');
+  const count = log.trim().split('\n').filter((l) => l.includes('chain ')).length;
+  eq(count, 30, '30 chain commits present');
+  // A non-fast-forward push on the deep chain is still rejected.
+  git(cdir, 'reset --hard HEAD~1');
+  let rejected = false;
+  try { git(cdir, 'push origin main'); } catch (e) { rejected = /non-fast-forward|rejected|failed to push/i.test(String((e as any).stderr ?? e)); }
+  ok(rejected, 'non-fast-forward on deep chain rejected');
 });
 await test('git: delete ref, annotated tag push, sideband report', async () => {
   const d = cloneDir;

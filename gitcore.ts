@@ -146,19 +146,41 @@ export function writePack(objects: Iterable<GitObject>): Buffer {
   const sum = createHash('sha1').update(head).digest();
   return Buffer.concat([head, sum]);
 }
-/** Inflate a zlib stream starting at off; returns data and the offset just past the stream. */
-function inflateAt(buf: Buffer, off: number, expectedSize: number): { data: Buffer; next: number } {
-  // Binary-search the smallest end that inflates to the expected size.
-  let lo = off + 1; let hi = buf.length; let found = -1;
-  while (lo <= hi) {
-    const mid = (lo + hi) >> 1;
-    try {
-      const d = inflateSync(buf.subarray(off, mid));
-      if (d.length === expectedSize) { found = mid; hi = mid - 1; } else { lo = mid + 1; }
-    } catch { lo = mid + 1; }
+/** Adler-32 (the checksum a zlib stream ends with), big-endian in the stream. */
+export function adler32(data: Uint8Array): number {
+  let a = 1; let b = 0;
+  const MOD = 65521;
+  for (let i = 0; i < data.length; i += 1) {
+    a = (a + data[i]!) % MOD;
+    b = (b + a) % MOD;
   }
-  if (found < 0) throw new Error('pack inflate failed');
-  return { data: inflateSync(buf.subarray(off, found)), next: found };
+  return ((b << 16) | a) >>> 0;
+}
+/** Inflate a zlib stream starting at off; returns data and the offset just past the stream.
+ * No binary search and no throws on truncation: inflateSync ignores bytes past the
+ * stream's end, so one inflate over a window that provably covers the stream (a deflate
+ * stream is at most its output size plus ~11 bytes per 64 KiB of stored blocks) yields
+ * the data; the stream's exact end is then found by scanning for its trailing
+ * Adler-32 and verifying with one exact inflate. A wrong size still throws. */
+function inflateAt(buf: Buffer, off: number, expectedSize: number): { data: Buffer; next: number } {
+  const margin = 32 + (expectedSize >> 13);
+  const windowEnd = Math.min(buf.length, off + expectedSize + margin);
+  const data = inflateSync(buf.subarray(off, windowEnd));
+  if (data.length !== expectedSize) throw new Error('pack inflate failed');
+  const needle = Buffer.alloc(4);
+  needle.writeUInt32BE(adler32(data) >>> 0);
+  let pos = buf.indexOf(needle, off);
+  while (pos >= 0 && pos + 4 <= windowEnd) {
+    const next = pos + 4;
+    try {
+      const check = inflateSync(buf.subarray(off, next));
+      if (check.length === expectedSize) return { data: check, next };
+    } catch {
+      // A coincidental Adler-32 match inside the compressed bytes: keep scanning.
+    }
+    pos = buf.indexOf(needle, pos + 1);
+  }
+  throw new Error('pack inflate failed');
 }
 function applyDelta(base: Buffer, delta: Buffer): Buffer {
   let off = 0;

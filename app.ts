@@ -3,7 +3,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { infoRefs, receivePack, uploadPack } from './git.ts';
 import { executeGraphQL } from './graphql.ts';
-import { handleMcp, issueJson, prJson, repoJson } from './mcp.ts';
+import { handleMcp, issueJson, issueJsonBuf, prJson, repoJson } from './mcp.ts';
 import { Store, type Issue, type Repo } from './store.ts';
 import { hashObject, parseCommit } from './gitcore.ts';
 
@@ -14,6 +14,12 @@ function sendJson(res: ServerResponse, status: number, body: unknown, headers: R
   const text = status === 204 ? '' : `${JSON.stringify(body)}\n`;
   res.writeHead(status, { 'content-type': JSON_TYPE, 'x-github-request-id': store.nextReqId(), ...headers, ...(status === 204 ? { 'content-length': '0' } : { 'content-length': String(Buffer.byteLength(text)) }) });
   res.end(text);
+}
+/** Send an already-serialized JSON Buffer (e.g. a cached issue body) without
+ * re-stringifying or re-measuring it. */
+function sendBuf(res: ServerResponse, status: number, body: Buffer, headers: Record<string, string> = {}): void {
+  res.writeHead(status, { 'content-type': JSON_TYPE, 'x-github-request-id': store.nextReqId(), ...headers, 'content-length': String(body.length) });
+  res.end(body);
 }
 function sendRaw(res: ServerResponse, status: number, contentType: string, body: Buffer): void {
   res.writeHead(status, { 'content-type': contentType, 'content-length': String(body.length), 'x-github-request-id': store.nextReqId() });
@@ -48,11 +54,11 @@ function authed(req: IncomingMessage): boolean {
   const h = req.headers.authorization ?? '';
   return h === `Bearer ${token}`;
 }
-function pathOf(req: IncomingMessage): string {
-  try { return new URL(req.url ?? '/', 'http://entry').pathname; } catch { return '/'; }
-}
-function queryOf(req: IncomingMessage): URLSearchParams {
-  try { return new URL(req.url ?? '/', 'http://entry').searchParams; } catch { return new URLSearchParams(); }
+function parseUrl(req: IncomingMessage): { path: string; q: URLSearchParams } {
+  try {
+    const u = new URL(req.url ?? '/', 'http://entry');
+    return { path: u.pathname, q: u.searchParams };
+  } catch { return { path: '/', q: new URLSearchParams() }; }
 }
 function dec(s: string): string { try { return decodeURIComponent(s); } catch { return s; } }
 function paginate<T>(items: T[], q: URLSearchParams, req: IncomingMessage, basePath: string): { page: T[]; link: string | null } {
@@ -106,8 +112,7 @@ export function createApp(): Server {
   return createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
       const method = req.method ?? 'GET';
-      const path = pathOf(req);
-      const q = queryOf(req);
+      const { path, q } = parseUrl(req);
       try {
         // ---- health probe (no auth) ----
         if (method === 'GET' && path === '/healthz') { sendJson(res, 200, { ok: true }); return; }
@@ -428,7 +433,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, method: str
     const issue: Issue | undefined = repo.issues.get(num);
     if (segs.length === 2) {
       if (!issue) { err(res, 404, 'Not Found'); return; }
-      if (method === 'GET') { sendJson(res, 200, issueJson(store, repo, issue)); return; }
+      if (method === 'GET') { sendBuf(res, 200, issueJsonBuf(store, repo, issue)); return; }
       if (method === 'PATCH') {
         const body = await jsonBody(req, res);
         if (body === null) return;
@@ -436,7 +441,8 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, method: str
         if (typeof body.title === 'string') issue.title = body.title;
         if (typeof body.body === 'string') issue.body = body.body;
         issue.updatedAt = store.ts();
-        sendJson(res, 200, issueJson(store, repo, issue));
+        issue.jsonCache = undefined;
+        sendBuf(res, 200, issueJsonBuf(store, repo, issue));
         return;
       }
       err(res, 404, 'Not Found');

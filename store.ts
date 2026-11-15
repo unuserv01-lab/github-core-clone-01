@@ -59,6 +59,8 @@ export interface IssueComment { id: number; body: string; user: Viewer; createdA
 export interface Issue {
   id: number; number: number; title: string; body: string; state: 'open' | 'closed';
   labels: Label[]; comments: IssueComment[]; createdAt: string; updatedAt: string; createdSeq: number;
+  /** Cached exact response bytes (JSON + '\n') of issueJson; cleared on any mutation. */
+  jsonCache?: Buffer;
 }
 export interface PullRequest {
   id: number; number: number; title: string; body: string; state: 'open' | 'closed';
